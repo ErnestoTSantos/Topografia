@@ -55,7 +55,20 @@ def bulge_to_arc(start, end, bulge, segments=12):
     return pts
 
 
-def parse_dxf_to_geojson(dxf_path):
+def parse_dxf_to_geojson(dxf_path, scale_factor=1.0, target_layers=None):
+    """
+    Processa um arquivo DXF para GeoJSON, aplicando fator de escala
+    e filtrando entidades por layer alvo.
+    """
+
+    if target_layers is not None:
+        if isinstance(target_layers, str):
+            target_layers = {target_layers}
+        elif isinstance(target_layers, (list, tuple)):
+            target_layers = set(target_layers)
+        else:
+            target_layers = None
+
     try:
         doc = ezdxf.readfile(dxf_path)
         msp = doc.modelspace()
@@ -63,15 +76,34 @@ def parse_dxf_to_geojson(dxf_path):
         lines = []
         layer_count = defaultdict(int)
 
+        original_drawing_entities = []
+
+        def should_include(entity):
+            layer = entity.dxf.layer
+            layer_count[layer] += 1
+
+            if target_layers is None:
+                return True
+            return layer in target_layers
+
         for e in msp.query("LINE"):
+            is_included = should_include(e)
+            if not is_included and target_layers is not None:
+                continue
+
             start = (e.dxf.start.x, e.dxf.start.y)
             end = (e.dxf.end.x, e.dxf.end.y)
             line = LineString([start, end])
             if not line.is_empty:
-                lines.append(line)
-            layer_count[e.dxf.layer] += 1
+                if is_included or target_layers is None:
+                    lines.append(line)
+                original_drawing_entities.append(line)
 
         for e in msp.query("LWPOLYLINE"):
+            is_included = should_include(e)
+            if not is_included and target_layers is not None:
+                continue
+
             pts = []
             bulges = []
 
@@ -102,13 +134,18 @@ def parse_dxf_to_geojson(dxf_path):
 
             if len(new_pts) >= 2:
                 try:
-                    lines.append(LineString(new_pts))
+                    line_string = LineString(new_pts)
+                    if is_included or target_layers is None:
+                        lines.append(line_string)
+                    original_drawing_entities.append(line_string)
                 except Exception:
                     pass
 
-            layer_count[e.dxf.layer] += 1
-
         for e in msp.query("POLYLINE"):
+            is_included = should_include(e)
+            if not is_included and target_layers is not None:
+                continue
+
             pts = []
             for v in e.vertices:
                 try:
@@ -117,45 +154,66 @@ def parse_dxf_to_geojson(dxf_path):
                     continue
 
             if len(pts) >= 2:
-                lines.append(LineString(pts))
-            layer_count[e.dxf.layer] += 1
+                line_string = LineString(pts)
+                if is_included or target_layers is None:
+                    lines.append(line_string)
+                original_drawing_entities.append(line_string)
 
         if len(lines) == 0:
-            raise ValueError("Nenhuma entidade de linha/polilinha encontrada no DXF.")
+            raise ValueError(
+                "Nenhuma entidade de linha/polilinha encontrada nos layers selecionados."
+            )
 
-        mls = MultiLineString(lines)
+        merged_lines = unary_union(lines)
 
-        polygons = list(polygonize(mls))
+        polygons = []
+        if target_layers is not None:
+            if merged_lines.geom_type in ("LineString", "MultiLineString"):
+                try:
+                    polygons = list(polygonize(merged_lines))
+                except Exception:
+                    polygons = []
+            else:
+                polygons = []
 
-        if len(polygons) == 0:
+        if len(polygons) == 0 and target_layers is not None:
             all_pts = []
+
             for l in lines:
                 all_pts.extend(list(l.coords))
 
-            outline = alphashape.alphashape(all_pts, 0.01)
-            if outline.geom_type == "Polygon":
-                polygons = [outline]
+            try:
+                outline = alphashape.alphashape(all_pts, 0.01)
 
-        if len(polygons) == 0:
+                if outline.geom_type == "Polygon":
+                    polygons = [outline]
+                elif outline.geom_type == "MultiPolygon":
+                    polygons.extend(list(outline.geoms))
+
+            except Exception:
+                pass
+
+        if len(polygons) == 0 and target_layers is not None:
             raise ValueError("Nenhuma construção pôde ser identificada.")
 
         features = []
         constructions = []
-
-        for poly in polygons:
-            data = {
-                "area": float(poly.area),
-                "perimeter": float(poly.length),
-                "vertices": len(list(poly.exterior.coords)),
-            }
-
-            constructions.append(data)
-
-            features.append(
-                {"type": "Feature", "properties": data, "geometry": mapping(poly)}
-            )
-
-        geojson_fc = {"type": "FeatureCollection", "features": features}
+        if target_layers is not None and len(polygons) > 0:
+            for poly in polygons:
+                if poly.is_valid and not poly.is_empty:
+                    data = {
+                        "area": float(poly.area) * (scale_factor**2),
+                        "perimeter": float(poly.length) * scale_factor,
+                        "vertices": len(list(poly.exterior.coords)),
+                    }
+                    constructions.append(data)
+                    features.append(
+                        {
+                            "type": "Feature",
+                            "properties": data,
+                            "geometry": mapping(poly),
+                        }
+                    )
 
         metadata = {
             "constructions": constructions,
@@ -164,7 +222,20 @@ def parse_dxf_to_geojson(dxf_path):
             "layers": list(layer_count.keys()),
         }
 
-        return json.dumps(geojson_fc), metadata, polygons
+        if target_layers is None:
+            geojson_fc = {
+                "type": "FeatureCollection",
+                "features": [
+                    {"type": "Feature", "geometry": mapping(l)}
+                    for l in original_drawing_entities
+                ],
+            }
+            return json.dumps(geojson_fc), metadata, original_drawing_entities
+        return (
+            json.dumps({"type": "FeatureCollection", "features": features}),
+            metadata,
+            polygons,
+        )
 
     except Exception as e:
         raise Exception(f"Erro ao processar DXF: {e}")
